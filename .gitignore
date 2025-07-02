@@ -1,2 +1,7 @@
-.env
 __pycache__/
+.en*
+.env.vault
+.flaskenv*
+!.env.project
+!.env.vault
+.env*
