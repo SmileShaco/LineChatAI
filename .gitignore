@@ -1,6 +1,5 @@
 __pycache__/
 .en*
-.env.vault
 .flaskenv*
 !.env.project
 !.env.vault
