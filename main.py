@@ -29,7 +29,7 @@ user_ai_chat_enabled = {}
 # ユーザーごとのトークン使用量を管理
 user_token_usage = {}
 
-# トークン価格設定（100万トークンあたりの価格）
+# トークン価格設定（100万トークンあたりの価格）- GPT-4o
 TOKEN_PRICES = {
     'input': 2.50,
     'cached_input': 1.25,
@@ -91,24 +91,34 @@ def update_token_usage(user_id, usage_data):
     """トークン使用量を更新"""
     initialize_token_usage(user_id)
 
-    # 入力トークン数
-    prompt_tokens = usage_data.get('prompt_tokens', 0)
-    # キャッシュされた入力トークン数（利用可能な場合）
-    cached_tokens = 0
-    if hasattr(usage_data, 'prompt_tokens_details') and usage_data.prompt_tokens_details:
-        cached_tokens = getattr(
-            usage_data.prompt_tokens_details, 'cached_tokens', 0)
+    try:
+        # 入力トークン数（CompletionUsageオブジェクトから直接取得）
+        prompt_tokens = getattr(usage_data, 'prompt_tokens', 0)
 
-    # 実際の入力トークン数（キャッシュを除く）
-    actual_input_tokens = prompt_tokens - cached_tokens
+        # キャッシュされた入力トークン数（利用可能な場合）
+        cached_tokens = 0
+        if hasattr(usage_data, 'prompt_tokens_details') and usage_data.prompt_tokens_details:
+            cached_tokens = getattr(
+                usage_data.prompt_tokens_details, 'cached_tokens', 0)
 
-    # 出力トークン数
-    completion_tokens = usage_data.get('completion_tokens', 0)
+        # 実際の入力トークン数（キャッシュを除く）
+        actual_input_tokens = prompt_tokens - cached_tokens
 
-    # 累計に追加
-    user_token_usage[user_id]['input_tokens'] += actual_input_tokens
-    user_token_usage[user_id]['cached_input_tokens'] += cached_tokens
-    user_token_usage[user_id]['output_tokens'] += completion_tokens
+        # 出力トークン数（CompletionUsageオブジェクトから直接取得）
+        completion_tokens = getattr(usage_data, 'completion_tokens', 0)
+
+        # 累計に追加
+        user_token_usage[user_id]['input_tokens'] += actual_input_tokens
+        user_token_usage[user_id]['cached_input_tokens'] += cached_tokens
+        user_token_usage[user_id]['output_tokens'] += completion_tokens
+
+        print(
+            f"トークン使用量記録: Input={actual_input_tokens}, Cached={cached_tokens}, Output={completion_tokens}")
+
+    except Exception as e:
+        print(f"トークン使用量記録エラー: {type(e).__name__}: {str(e)}")
+        print(f"usage_data type: {type(usage_data)}")
+        print(f"usage_data attributes: {dir(usage_data)}")
 
 
 def calculate_cost(user_id):
