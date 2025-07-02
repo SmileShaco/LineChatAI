@@ -26,6 +26,15 @@ client = openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 user_chat_histories = {}
 # ユーザーごとのAIチャット有効/無効状態を管理
 user_ai_chat_enabled = {}
+# ユーザーごとのトークン使用量を管理
+user_token_usage = {}
+
+# トークン価格設定（100万トークンあたりの価格）
+TOKEN_PRICES = {
+    'input': 2.50,
+    'cached_input': 1.25,
+    'output': 10.00
+}
 
 # 夫婦チャット用のシステムプロンプトテンプレート
 COUPLE_CHAT_TEMPLATE = """以下の条件で、夫婦のチャット内容に対してメッセージを返してください：
@@ -68,6 +77,72 @@ def is_first_message(user_id):
     return user_id not in user_chat_histories or len(user_chat_histories[user_id]) == 0
 
 
+def initialize_token_usage(user_id):
+    """ユーザーのトークン使用量を初期化"""
+    if user_id not in user_token_usage:
+        user_token_usage[user_id] = {
+            'input_tokens': 0,
+            'cached_input_tokens': 0,
+            'output_tokens': 0
+        }
+
+
+def update_token_usage(user_id, usage_data):
+    """トークン使用量を更新"""
+    initialize_token_usage(user_id)
+
+    # 入力トークン数
+    prompt_tokens = usage_data.get('prompt_tokens', 0)
+    # キャッシュされた入力トークン数（利用可能な場合）
+    cached_tokens = 0
+    if hasattr(usage_data, 'prompt_tokens_details') and usage_data.prompt_tokens_details:
+        cached_tokens = getattr(
+            usage_data.prompt_tokens_details, 'cached_tokens', 0)
+
+    # 実際の入力トークン数（キャッシュを除く）
+    actual_input_tokens = prompt_tokens - cached_tokens
+
+    # 出力トークン数
+    completion_tokens = usage_data.get('completion_tokens', 0)
+
+    # 累計に追加
+    user_token_usage[user_id]['input_tokens'] += actual_input_tokens
+    user_token_usage[user_id]['cached_input_tokens'] += cached_tokens
+    user_token_usage[user_id]['output_tokens'] += completion_tokens
+
+
+def calculate_cost(user_id):
+    """ユーザーの累計コストを計算"""
+    initialize_token_usage(user_id)
+
+    usage = user_token_usage[user_id]
+
+    # 各トークンタイプのコスト計算（100万トークンあたりの価格）
+    input_cost = (usage['input_tokens'] / 1_000_000) * TOKEN_PRICES['input']
+    cached_input_cost = (usage['cached_input_tokens'] /
+                         1_000_000) * TOKEN_PRICES['cached_input']
+    output_cost = (usage['output_tokens'] / 1_000_000) * TOKEN_PRICES['output']
+
+    total_cost = input_cost + cached_input_cost + output_cost
+
+    return {
+        'input_cost': input_cost,
+        'cached_input_cost': cached_input_cost,
+        'output_cost': output_cost,
+        'total_cost': total_cost
+    }
+
+
+def reset_token_usage(user_id):
+    """ユーザーのトークン使用量をリセット"""
+    if user_id in user_token_usage:
+        user_token_usage[user_id] = {
+            'input_tokens': 0,
+            'cached_input_tokens': 0,
+            'output_tokens': 0
+        }
+
+
 def get_gpt_response(user_message, user_id):
     """OpenAI APIを使ってレスポンスを取得（会話履歴込み）"""
     try:
@@ -93,13 +168,17 @@ def get_gpt_response(user_message, user_id):
             messages.append({"role": "user", "content": user_message})
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=messages,
             max_tokens=1000,
             temperature=0.7
         )
 
         assistant_response = response.choices[0].message.content
+
+        # トークン使用量を記録
+        if hasattr(response, 'usage') and response.usage:
+            update_token_usage(user_id, response.usage)
 
         # 会話履歴を更新
         if user_id not in user_chat_histories:
@@ -221,6 +300,42 @@ def handle_message(event):
             TextSendMessage(text=reply)
         )
 
+    elif text.lower() in ["cost", "コスト"]:
+        # コスト情報を表示
+        initialize_token_usage(user_id)
+        usage = user_token_usage[user_id]
+        costs = calculate_cost(user_id)
+
+        reply = f"""💰 累計コスト情報
+
+【トークン使用量】
+Input: {usage['input_tokens']:,} tokens
+Cached Input: {usage['cached_input_tokens']:,} tokens  
+Output: {usage['output_tokens']:,} tokens
+
+【費用詳細】
+Input: ${costs['input_cost']:.6f}
+Cached Input: ${costs['cached_input_cost']:.6f}
+Output: ${costs['output_cost']:.6f}
+
+🔸 合計費用: ${costs['total_cost']:.6f}"""
+
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply)
+        )
+
+    elif text.lower() in ["reset cost", "コストリセット"]:
+        # コストをリセット
+        reset_token_usage(user_id)
+
+        reply = "💰 累計コストを初期化しました\n\n全てのトークン使用量と費用が0にリセットされました。"
+
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply)
+        )
+
     elif text == "メインメニュー":
         # メインメニューを表示
         chat_count = get_chat_summary(user_id)
@@ -234,7 +349,9 @@ AIチャット状態: {ai_status}
 【コマンド】
 📝 「on」: AI会話モードを開始
 📴 「off」: AI会話モードを停止
-🗑️ 「クリア」: 会話履歴をリセット"""
+🗑️ 「クリア」: 会話履歴をリセット
+💰 「cost」: 累計コストを表示
+🔄 「reset cost」: コストをリセット"""
 
         line_bot_api.reply_message(
             event.reply_token,
@@ -253,7 +370,8 @@ AIチャット状態: {'ON' if ai_enabled else 'OFF'}
 現在の会話数: {chat_count}回
 初回メッセージ: {'はい' if is_first else 'いいえ'}
 メモリ使用中のユーザー数: {len(user_chat_histories)}人
-AIチャット有効ユーザー数: {len([u for u in user_ai_chat_enabled.values() if u])}人"""
+AIチャット有効ユーザー数: {len([u for u in user_ai_chat_enabled.values() if u])}人
+トークン追跡ユーザー数: {len(user_token_usage)}人"""
 
         line_bot_api.reply_message(
             event.reply_token,
