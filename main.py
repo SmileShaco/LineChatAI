@@ -1,19 +1,17 @@
-import glob
-import json
 import os
-from datetime import datetime
 
 import openai
+from dotenv import load_dotenv
 from flask import Flask, abort, request
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import (FollowEvent, MessageAction, MessageEvent,
-                            PostbackAction, PostbackEvent, QuickReply,
-                            QuickReplyButton, TextMessage, TextSendMessage)
+from linebot.models import (FollowEvent, MessageEvent, TextMessage,
+                            TextSendMessage)
 
+load_dotenv()
 app = Flask(__name__)
 
-# 環境変数からLINEのキーを取得
+# 環境変数からキーを取得
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -22,167 +20,120 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # OpenAI APIクライアントの設定
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+client = openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# ユーザーごとの現在のチャットファイルを管理
-user_chat_files = {}
+# ユーザーごとの会話履歴を管理（メモリベース）
+user_chat_histories = {}
+# ユーザーごとのAIチャット有効/無効状態を管理
+user_ai_chat_enabled = {}
+
+# 夫婦チャット用のシステムプロンプトテンプレート
+COUPLE_CHAT_TEMPLATE = """以下の条件で、夫婦のチャット内容に対してメッセージを返してください：
+
+# 目的
+わかりやすく質問に対して回答すること
+
+# 語り手の人物像
+・静かで優しくて、あたたかい空気をまとう女性
+・ゆったりと落ち着いた口調で話す
+・お姉さんでもお母さんでもない。少し距離のある、でも信頼できる存在
+・ロマンチックな表現や詩的な言い回しは避け、日常的で素直な日本語を使う
+
+# 文章の特徴
+・やさしい口調で語りかけるように
+・必要あれば語り手自身が「こんなふうにしてみるのはどうかな」と提案する
+・責めたり決めつけたりせず、安心感のある文体にする
+
+# 出力の形式
+会話を読んだ語り手が、状況をそっと受けとめながら、ふたりにやさしく語りかける
+
+# 入力の形式
+[ユーザーの入力]
+
+{user_message}"""
 
 
-def ensure_directories():
-    """必要なディレクトリが存在することを確認"""
-    os.makedirs("chatlog", exist_ok=True)
-    os.makedirs("summarylog", exist_ok=True)
+def is_ai_chat_enabled(user_id):
+    """ユーザーのAIチャット有効状態を取得"""
+    return user_ai_chat_enabled.get(user_id, False)
 
 
-def create_new_chat_file(user_id):
-    """新しいチャットファイルを作成"""
-    ensure_directories()
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    filename = f"{timestamp}.txt"
-    chat_path = f"chatlog/{filename}"
-    summary_path = f"summarylog/{filename}"
+def set_ai_chat_enabled(user_id, enabled):
+    """ユーザーのAIチャット有効状態を設定"""
+    user_ai_chat_enabled[user_id] = enabled
 
-    # 空のファイルを作成
+
+def is_first_message(user_id):
+    """ユーザーの初回メッセージかどうかを判定"""
+    return user_id not in user_chat_histories or len(user_chat_histories[user_id]) == 0
+
+
+def get_gpt_response(user_message, user_id):
+    """OpenAI APIを使ってレスポンスを取得（会話履歴込み）"""
     try:
-        open(chat_path, 'w', encoding='utf-8').close()
-        open(summary_path, 'w', encoding='utf-8').close()
-        user_chat_files[user_id] = filename
-        return filename
-    except Exception as e:
-        print(f"ファイル作成エラー: {e}")
-        return None
+        if not OPENAI_API_KEY or not client:
+            return "OpenAI APIキーが設定されていません。管理者にお問い合わせください。"
 
+        # 初回メッセージの場合は夫婦チャット用テンプレートを使用
+        if is_first_message(user_id):
+            formatted_message = COUPLE_CHAT_TEMPLATE.format(
+                user_message=user_message)
+            messages = [
+                {"role": "user", "content": formatted_message}
+            ]
+        else:
+            # 2回目以降は会話履歴を使用（トークン節約）
+            chat_history = user_chat_histories.get(user_id, [])
+            messages = []
 
-def add_to_chat_log(filename, user_name, user_message, gpt_response):
-    """チャットログにメッセージを追加"""
-    chat_path = f"chatlog/{filename}"
-    try:
-        with open(chat_path, 'a', encoding='utf-8') as f:
-            f.write(f"[{user_name}]: {user_message}\n")
-            f.write(f"[gpt]: {gpt_response}\n")
-    except Exception as e:
-        print(f"チャットログ書き込みエラー: {e}")
+            # 過去の会話履歴を追加
+            messages.extend(chat_history)
 
-
-def get_summary(filename):
-    """サマリーファイルの内容を取得"""
-    summary_path = f"summarylog/{filename}"
-    try:
-        with open(summary_path, 'r', encoding='utf-8') as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        return ""
-    except Exception as e:
-        print(f"サマリー読み込みエラー: {e}")
-        return ""
-
-
-def create_summary(filename):
-    """チャットログをサマライズしてサマリーファイルに保存"""
-    chat_path = f"chatlog/{filename}"
-    summary_path = f"summarylog/{filename}"
-
-    try:
-        with open(chat_path, 'r', encoding='utf-8') as f:
-            chat_content = f.read()
-
-        if not chat_content.strip():
-            return False
-
-        # OpenAI APIでサマライズ
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "user", "content": f"{chat_content}\n\n1000文字以内に文字で要約して"}
-            ],
-            max_tokens=500
-        )
-
-        summary = response.choices[0].message.content
-
-        with open(summary_path, 'w', encoding='utf-8') as f:
-            f.write(summary)
-        return True
-    except Exception as e:
-        print(f"サマリー作成エラー: {e}")
-        return False
-
-
-def get_gpt_response(user_message, filename=None):
-    """OpenAI APIを使ってレスポンスを取得"""
-    try:
-        # サマリーがある場合は追加
-        message_content = user_message
-        if filename:
-            summary = get_summary(filename)
-            if summary:
-                message_content += f"\n\n過去のやり取り\n{summary}"
+            # 現在のユーザーメッセージを追加
+            messages.append({"role": "user", "content": user_message})
 
         response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "user", "content": message_content}
-            ],
-            max_tokens=1000
+            model="gpt-4o-mini",
+            messages=messages,
+            max_tokens=1000,
+            temperature=0.7
         )
 
-        return response.choices[0].message.content
+        assistant_response = response.choices[0].message.content
+
+        # 会話履歴を更新
+        if user_id not in user_chat_histories:
+            user_chat_histories[user_id] = []
+
+        user_chat_histories[user_id].append(
+            {"role": "user", "content": user_message})
+        user_chat_histories[user_id].append(
+            {"role": "assistant", "content": assistant_response})
+
+        # 会話履歴が長くなりすぎた場合は古いものから削除（最新20回の会話のみ保持）
+        if len(user_chat_histories[user_id]) > 40:  # 20回の会話 = 40メッセージ
+            user_chat_histories[user_id] = user_chat_histories[user_id][-40:]
+
+        return assistant_response
+
     except Exception as e:
-        print(f"OpenAI APIエラー: {e}")
+        print(f"OpenAI APIエラー: {type(e).__name__}: {str(e)}")
         return "申し訳ございません。現在、AIサービスに接続できません。しばらく後にお試しください。"
 
 
-def get_chat_history_list():
-    """チャット履歴のリストを取得（新しい順）"""
-    ensure_directories()
-    chat_files = glob.glob("chatlog/*.txt")
-    # ファイル名でソート（新しい順）
-    chat_files.sort(reverse=True)
-    return [os.path.basename(f) for f in chat_files]
+def clear_chat_history(user_id):
+    """指定ユーザーの会話履歴をクリア"""
+    if user_id in user_chat_histories:
+        del user_chat_histories[user_id]
+        return True
+    return False
 
 
-def get_main_menu():
-    """メインメニューのクイックリプライを作成"""
-    return QuickReply(
-        items=[
-            QuickReplyButton(
-                action=MessageAction(label="新しいチャット", text="新しいチャット")
-            ),
-            QuickReplyButton(
-                action=MessageAction(label="過去の履歴", text="過去の履歴")
-            )
-        ]
-    )
-
-
-def get_chat_history_menu():
-    """チャット履歴選択メニューのクイックリプライを作成"""
-    chat_files = get_chat_history_list()
-    items = []
-
-    for chat_file in chat_files[:10]:  # 最大10件まで表示
-        # ファイル名を読みやすい形式に変換
-        timestamp = chat_file.replace('.txt', '')
-        try:
-            dt = datetime.strptime(timestamp, "%Y%m%d%H%M%S")
-            display_name = dt.strftime("%m/%d %H:%M")
-        except:
-            display_name = chat_file
-
-        items.append(
-            QuickReplyButton(
-                action=MessageAction(label=display_name,
-                                     text=f"履歴選択:{chat_file}")
-            )
-        )
-
-    items.append(
-        QuickReplyButton(
-            action=MessageAction(label="メインメニューに戻る", text="メインメニュー")
-        )
-    )
-
-    return QuickReply(items=items)
+def get_chat_summary(user_id):
+    """現在の会話数を取得"""
+    if user_id in user_chat_histories:
+        return len(user_chat_histories[user_id]) // 2  # ユーザー+アシスタントで1回の会話
+    return 0
 
 
 @app.route("/", methods=["GET"])
@@ -208,16 +159,19 @@ def handle_follow(event):
     """友達追加時の処理"""
     welcome_message = """LineChatAIへようこそ！🤖
 
-このBotでは、OpenAI ChatGPT-4oと会話できます。
+このBotでは、夫婦の会話に優しくアドバイスする
+AIアシスタントと対話できます。
 
-📝 新しいチャット: 新しい会話を開始
-📋 過去の履歴: 過去の会話を確認・継続
+【コマンド】
+📝 「on」または「ON」: AI会話モードを開始
+📴 「off」または「OFF」: AI会話モードを停止
+🗑️ 「クリア」「clear」「Clear」「CLEAR」: 会話履歴をリセット
 
-まずは下のメニューからお選びください。"""
+まずは「on」と入力してAIチャットを開始してください。"""
 
     line_bot_api.reply_message(
         event.reply_token,
-        TextSendMessage(text=welcome_message, quick_reply=get_main_menu())
+        TextSendMessage(text=welcome_message)
     )
 
 
@@ -226,77 +180,41 @@ def handle_message(event):
     user_id = event.source.user_id
     text = event.message.text
 
-    # ユーザー名を取得（実際の実装では、Lineプロフィールから取得することも可能）
+    # ユーザー名を取得
     try:
         profile = line_bot_api.get_profile(user_id)
         user_name = profile.display_name
     except:
         user_name = "ユーザー"
 
-    if text == "新しいチャット":
-        # 新しいチャットを開始
-        filename = create_new_chat_file(user_id)
-        if filename:
-            timestamp = filename.replace('.txt', '')
-            try:
-                dt = datetime.strptime(timestamp, "%Y%m%d%H%M%S")
-                display_time = dt.strftime("%Y年%m月%d日 %H:%M")
-            except:
-                display_time = filename
+    if text.lower() == "on":
+        # AIチャットを有効化
+        set_ai_chat_enabled(user_id, True)
 
-            reply = f"新しいチャットを開始しました 📝\n作成時刻: {display_time}\n\n何かご質問はありますか？"
-        else:
-            reply = "チャットファイルの作成に失敗しました。もう一度お試しください。"
+        reply = "……ラファエルによる応答機能を起動しました 📝"
 
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text=reply)
         )
 
-    elif text == "過去の履歴":
-        # 過去の履歴を表示
-        chat_files = get_chat_history_list()
-        if chat_files:
-            reply = "過去のチャット履歴を選択してください 📋"
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(
-                    text=reply, quick_reply=get_chat_history_menu())
-            )
-        else:
-            reply = "まだチャット履歴がありません。\n「新しいチャット」を開始してください 😊"
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=reply, quick_reply=get_main_menu())
-            )
+    elif text.lower() == "off":
+        # AIチャットを無効化
+        set_ai_chat_enabled(user_id, False)
 
-    elif text.startswith("履歴選択:"):
-        # 特定の履歴を選択
-        filename = text.replace("履歴選択:", "")
-        user_chat_files[user_id] = filename
+        reply = "……ラファエルによる応答機能を停止しました 📴\n\n以後もメッセージの受信は継続されますが、ラファエルからの返答は行われません。\n\n再開を希望される場合は「on」と入力してください。\n\n──設定、正常に反映されました。"
 
-        # チャット履歴を表示
-        chat_path = f"chatlog/{filename}"
-        try:
-            with open(chat_path, 'r', encoding='utf-8') as f:
-                history = f.read()
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply)
+        )
 
-            timestamp = filename.replace('.txt', '')
-            try:
-                dt = datetime.strptime(timestamp, "%Y%m%d%H%M%S")
-                display_time = dt.strftime("%Y年%m月%d日 %H:%M")
-            except:
-                display_time = filename
+    elif text in ["クリア", "clear", "Clear", "CLEAR"]:
+        # 会話履歴をクリア
+        chat_count = get_chat_summary(user_id)
+        clear_chat_history(user_id)
 
-            if history.strip():
-                # 履歴が長い場合は末尾のみ表示
-                if len(history) > 1000:
-                    history = "...(省略)...\n" + history[-800:]
-                reply = f"📋 チャット履歴 ({display_time}):\n\n{history}\n\n続きからチャットできます。"
-            else:
-                reply = f"📋 チャット履歴 ({display_time}) は空です。\n\n新しくチャットを開始できます。"
-        except FileNotFoundError:
-            reply = "チャット履歴が見つかりませんでした。"
+        reply = f"……会話履歴を消去しました 🗑️\n（累計 {chat_count} 回の対話ログを初期化）\n\n次のメッセージより、新規会話として処理を開始します。"
 
         line_bot_api.reply_message(
             event.reply_token,
@@ -305,52 +223,58 @@ def handle_message(event):
 
     elif text == "メインメニュー":
         # メインメニューを表示
-        reply = "メニューを選択してください 🎯"
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=reply, quick_reply=get_main_menu())
-        )
+        chat_count = get_chat_summary(user_id)
+        ai_status = "ON" if is_ai_chat_enabled(user_id) else "OFF"
 
-    elif text == "サマリー作成":
-        # 現在のチャットをサマライズ
-        if user_id in user_chat_files:
-            filename = user_chat_files[user_id]
-            if create_summary(filename):
-                reply = f"📝 チャット履歴のサマリーを作成しました。\n\n今後のメッセージではこのサマリーが文脈として活用されます。"
-            else:
-                reply = "サマリーの作成に失敗しました。チャット内容が空か、APIエラーが発生しました。"
-        else:
-            reply = "アクティブなチャットがありません。\n「新しいチャット」を開始してください。"
+        reply = f"""📊 現在の状態
+
+AIチャット状態: {ai_status}
+現在の会話数: {chat_count}回
+
+【コマンド】
+📝 「on」: AI会話モードを開始
+📴 「off」: AI会話モードを停止
+🗑️ 「クリア」: 会話履歴をリセット"""
 
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text=reply)
         )
 
+    elif text == "デバッグ情報":
+        # デバッグ情報を表示
+        chat_count = get_chat_summary(user_id)
+        ai_enabled = is_ai_chat_enabled(user_id)
+        is_first = is_first_message(user_id)
+
+        debug_info = f"""🔧 デバッグ情報:
+OpenAI APIキー設定: {'✅' if OPENAI_API_KEY else '❌'}
+AIチャット状態: {'ON' if ai_enabled else 'OFF'}
+現在の会話数: {chat_count}回
+初回メッセージ: {'はい' if is_first else 'いいえ'}
+メモリ使用中のユーザー数: {len(user_chat_histories)}人
+AIチャット有効ユーザー数: {len([u for u in user_ai_chat_enabled.values() if u])}人"""
+
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=debug_info)
+        )
+
     else:
-        # 通常のチャット
-        if user_id not in user_chat_files:
-            # まだチャットファイルがない場合
-            reply = "まず「新しいチャット」を開始してください 😊"
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=reply, quick_reply=get_main_menu())
-            )
-        else:
-            # GPTにメッセージを送信
-            filename = user_chat_files[user_id]
-            gpt_response = get_gpt_response(text, filename)
+        # 通常のメッセージ処理
+        if not is_ai_chat_enabled(user_id):
+            # AIチャットがOFFの場合は処理を弾く（何も返さない）
+            return
 
-            # チャットログに追加
-            add_to_chat_log(filename, user_name, text, gpt_response)
+        # AIチャットがONの場合はGPTとの会話
+        gpt_response = get_gpt_response(text, user_id)
 
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=gpt_response)
-            )
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=gpt_response)
+        )
 
 
 if __name__ == "__main__":
-    ensure_directories()
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port, debug=True)
